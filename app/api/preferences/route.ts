@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { initDb, getDb } from "@/lib/db";
+import { initDb, preferences } from "@/lib/mongo";
 import { TAXONOMY } from "@/lib/categories";
 
 const DEFAULT_SETTINGS = {
@@ -13,7 +13,7 @@ export const dynamic = "force-dynamic";
 
 export async function POST(request: Request) {
   await initDb();
-  const db = getDb();
+  const col = await preferences();
   const body = await request.json();
   const { anonId, categories, settings } = body;
 
@@ -27,28 +27,35 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: "No valid categories" }, { status: 400 });
     }
 
-    const existing = await db.query("SELECT settings FROM preferences WHERE anon_id = $1", [anonId]);
-    const merged = { ...DEFAULT_SETTINGS, ...(existing.rows[0]?.settings || {}), ...(settings || {}) };
+    const existing = await col.findOne({ _id: anonId });
+    const merged = { ...DEFAULT_SETTINGS, ...(existing?.settings || {}), ...(settings || {}) };
 
-    await db.query(
-      `INSERT INTO preferences (anon_id, categories, settings, updated_at)
-       VALUES ($1, $2, $3, NOW())
-       ON CONFLICT (anon_id)
-       DO UPDATE SET categories = $2, settings = $3, updated_at = NOW()`,
-      [anonId, valid, JSON.stringify(merged)]
+    // Replaces the Postgres INSERT ... ON CONFLICT DO UPDATE.
+    await col.updateOne(
+      { _id: anonId },
+      { $set: { categories: valid, settings: merged, updated_at: new Date() } },
+      { upsert: true }
     );
 
     return NextResponse.json({ ok: true, categories: valid, settings: merged });
   }
 
   if (settings) {
-    await db.query(
-      `UPDATE preferences SET settings = settings || $2::jsonb, updated_at = NOW() WHERE anon_id = $1
-       RETURNING settings`,
-      [anonId, JSON.stringify(settings)]
+    // The old query used `settings || $2::jsonb` to shallow-merge. Mongo has no
+    // direct equivalent for a nested object merge, so read-merge-write it is.
+    // Upserting here matters: the Postgres version issued a bare UPDATE, so a
+    // settings change from a user with no preferences row silently did nothing.
+    const existing = await col.findOne({ _id: anonId });
+    const merged = { ...DEFAULT_SETTINGS, ...(existing?.settings || {}), ...settings };
+    await col.updateOne(
+      { _id: anonId },
+      {
+        $set: { settings: merged, updated_at: new Date() },
+        $setOnInsert: { categories: existing?.categories ?? [] },
+      },
+      { upsert: true }
     );
-    const updated = await db.query("SELECT settings FROM preferences WHERE anon_id = $1", [anonId]);
-    return NextResponse.json({ ok: true, settings: updated.rows[0]?.settings || {} });
+    return NextResponse.json({ ok: true, settings: merged });
   }
 
   return NextResponse.json({ error: "No update provided" }, { status: 400 });
@@ -56,14 +63,14 @@ export async function POST(request: Request) {
 
 export async function GET(request: Request) {
   await initDb();
-  const db = getDb();
   const { searchParams } = new URL(request.url);
   const anonId = searchParams.get("anonId");
   if (!anonId) return NextResponse.json({ categories: [], settings: DEFAULT_SETTINGS });
 
-  const result = await db.query("SELECT categories, settings FROM preferences WHERE anon_id = $1", [anonId]);
+  const col = await preferences();
+  const doc = await col.findOne({ _id: anonId });
   return NextResponse.json({
-    categories: result.rows[0]?.categories || [],
-    settings: { ...DEFAULT_SETTINGS, ...(result.rows[0]?.settings || {}) },
+    categories: doc?.categories || [],
+    settings: { ...DEFAULT_SETTINGS, ...(doc?.settings || {}) },
   });
 }

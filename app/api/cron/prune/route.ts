@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { initDb } from "@/lib/db";
+import { initDb } from "@/lib/mongo";
 import { runPrune } from "@/lib/prune";
 
 export const dynamic = "force-dynamic";

@@ -27,6 +27,12 @@ yarn-error.log*
 
 # local env files
 .env*.local
+# `.env` held a real GEMINI_API_KEY and was being tracked. Only .env.example
+# belongs in git.
+.env
+# Stray copy of .env (likely a typo'd shell redirect) that also holds real keys.
+/env
+!.env.example
 
 # vercel
 .vercel

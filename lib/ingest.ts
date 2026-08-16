@@ -1,4 +1,4 @@
-import { getDb } from "./db";
+import { initDb, articles, nextArticleId } from "./mongo";
 import { fetchAllFeeds, extractArticle } from "./rss";
 import { summarizeAndClassify } from "./gemini";
 import { classifyWithKeywords } from "./classify-fallback";
@@ -27,18 +27,21 @@ async function withRetry<T>(fn: () => Promise<T>, label: string): Promise<T | nu
 }
 
 export async function runIngestion(limit = 30) {
-  const db = getDb();
+  await initDb();
+  const col = await articles();
 
   const raw = await fetchAllFeeds();
   if (raw.length === 0) return { inserted: 0, total: 0 };
 
   const links = raw.map((r) => r.link);
   const canonicals = raw.map((r) => r.canonicalLink || r.link);
-  const existing = await db.query(
-    "SELECT link, canonical_link FROM articles WHERE link = ANY($1) OR canonical_link = ANY($2)",
-    [links, canonicals]
-  );
-  const existingSet = new Set(existing.rows.flatMap((r) => [r.link, r.canonical_link]));
+  const existing = await col
+    .find(
+      { $or: [{ link: { $in: links } }, { canonical_link: { $in: canonicals } }] },
+      { projection: { link: 1, canonical_link: 1 } }
+    )
+    .toArray();
+  const existingSet = new Set(existing.flatMap((r) => [r.link, r.canonical_link]));
 
   const newItems = raw
     .filter((r) => !existingSet.has(r.link) && !existingSet.has(r.canonicalLink || r.link))
@@ -93,32 +96,34 @@ export async function runIngestion(limit = 30) {
       ? fallbackImageUrl(topCategory, item.title)
       : extracted.imageUrl;
 
-    const articleRes = await db.query(
-      `INSERT INTO articles (title, link, canonical_link, source, published_at, summary, tldr_bullets, content, image_url, image_is_fallback)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-       RETURNING id`,
-      [
-        item.title,
-        item.link,
-        item.canonicalLink,
-        item.source,
-        item.publishedAt || new Date(),
-        classified.summary,
-        classified.tldr,
-        extracted.content,
-        imageUrl,
-        extracted.imageIsFallback,
-      ]
-    );
-    const articleId = articleRes.rows[0].id;
-
-    for (const c of classified.categories) {
-      await db.query(
-        `INSERT INTO article_categories (article_id, category, score)
-         VALUES ($1, $2, $3)
-         ON CONFLICT (article_id, category) DO NOTHING`,
-        [articleId, c.category, c.score]
-      );
+    // Categories are embedded, so the article and its classifications land in a
+    // single write instead of an insert plus one row per category.
+    try {
+      await col.insertOne({
+        id: await nextArticleId(),
+        title: item.title,
+        link: item.link,
+        canonical_link: item.canonicalLink || null,
+        source: item.source,
+        published_at: item.publishedAt || new Date(),
+        summary: classified.summary,
+        tldr_bullets: classified.tldr || [],
+        content: extracted.content,
+        image_url: imageUrl,
+        image_is_fallback: extracted.imageIsFallback,
+        created_at: new Date(),
+        categories: classified.categories.map((c) => ({
+          category: c.category,
+          score: c.score,
+        })),
+      });
+    } catch (err: any) {
+      // Unique index on link/canonical_link: a concurrent run already took it.
+      if (err?.code === 11000) {
+        console.warn(`Skipping ${item.link}: already ingested`);
+        continue;
+      }
+      throw err;
     }
     inserted++;
   }

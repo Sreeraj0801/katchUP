@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { initDb } from "@/lib/db";
+import { initDb } from "@/lib/mongo";
 import { runIngestion } from "@/lib/ingest";
 
 // Guarded by CRON_SECRET when that env var is set, so the same route is safe

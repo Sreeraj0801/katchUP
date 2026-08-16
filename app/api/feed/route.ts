@@ -1,16 +1,16 @@
 import { NextResponse } from "next/server";
-import { initDb, getDb } from "@/lib/db";
+import { initDb, articles, likes } from "@/lib/mongo";
 import { TAXONOMY } from "@/lib/categories";
 import { rankArticles, THRESHOLD } from "@/lib/rank";
 import { fallbackImageUrl } from "@/lib/images";
 
 const PAGE_SIZE = 10;
+const CANDIDATE_LIMIT = 200;
 
 export const dynamic = "force-dynamic";
 
 export async function GET(request: Request) {
   await initDb();
-  const db = getDb();
   const { searchParams } = new URL(request.url);
   const anonId = searchParams.get("anonId") || "";
   const catsParam = searchParams.get("categories") || "";
@@ -25,59 +25,63 @@ export async function GET(request: Request) {
     return NextResponse.json({ error: "No valid categories selected" }, { status: 400 });
   }
 
-  const [articlesRes, likesRes, totalLikesRes] = await Promise.all([
-    db.query(
-      `SELECT a.id, a.title, a.link, a.source, a.published_at, a.summary, a.tldr_bullets, a.content, a.image_url, a.image_is_fallback,
-              json_agg(json_build_object('category', ac.category, 'score', ac.score)) AS categories
-       FROM articles a
-       JOIN article_categories ac ON a.id = ac.article_id
-       WHERE ac.category = ANY($1) AND ac.score >= $2
-       GROUP BY a.id
-       ORDER BY a.published_at DESC
-       LIMIT $3`,
-      [selected, THRESHOLD, 200]
-    ),
-    anonId
-      ? db.query(
-          `SELECT l.article_id, array_agg(ac.category) AS categories
-           FROM likes l
-           JOIN article_categories ac ON l.article_id = ac.article_id
-           WHERE l.anon_id = $1
-           GROUP BY l.article_id`,
-          [anonId]
-        )
-      : Promise.resolve({ rows: [] }),
-    anonId
-      ? db.query(
-          `SELECT COUNT(*) FROM likes WHERE anon_id = $1`,
-          [anonId]
-        )
-      : Promise.resolve({ rows: [{ count: 0 }] }),
+  const [articlesCol, likesCol] = await Promise.all([articles(), likes()]);
+
+  // Categories are embedded, so this replaces the old articles/article_categories
+  // join with a single indexed query. $elemMatch is required so the category and
+  // the score threshold are matched on the *same* array element.
+  const [rows, likeRows] = await Promise.all([
+    articlesCol
+      .find({
+        categories: { $elemMatch: { category: { $in: selected }, score: { $gte: THRESHOLD } } },
+      })
+      .sort({ published_at: -1 })
+      .limit(CANDIDATE_LIMIT)
+      .toArray(),
+    anonId ? likesCol.find({ anon_id: anonId }).toArray() : Promise.resolve([]),
   ]);
 
-  const likedIds = new Set<number>(likesRes.rows.map((r: any) => r.article_id));
+  const likedIds = new Set<number>(likeRows.map((l) => l.article_id));
+
+  // The old query derived per-category like counts via a join onto
+  // article_categories. With categories embedded we can count them off the
+  // liked articles directly.
   const likeCounts: Record<string, number> = {};
-  for (const row of likesRes.rows) {
-    for (const c of row.categories || []) {
-      likeCounts[c] = (likeCounts[c] || 0) + 1;
+  if (likedIds.size > 0) {
+    const likedArticles = await articlesCol
+      .find({ id: { $in: [...likedIds] } }, { projection: { categories: 1 } })
+      .toArray();
+    for (const a of likedArticles) {
+      for (const c of a.categories || []) {
+        likeCounts[c.category] = (likeCounts[c.category] || 0) + 1;
+      }
     }
   }
-  const totalLikes = parseInt(totalLikesRes.rows[0]?.count || "0", 10);
+  const totalLikes = likedIds.size;
 
-  const articles = articlesRes.rows.map((r: any) => {
-    const cats = r.categories.filter((c: any) => c.category && selected.includes(c.category));
+  const mapped = rows.map((r) => {
+    const cats = (r.categories || []).filter(
+      (c) => c.category && selected.includes(c.category)
+    );
     const topCategory = cats[0]?.category || selected[0] || "AI";
     const hasImage = !!r.image_url;
     const image_url = r.image_url || fallbackImageUrl(topCategory, r.title);
     return {
-      ...r,
-      categories: cats,
+      id: r.id,
+      title: r.title,
+      link: r.link,
+      source: r.source,
+      published_at: r.published_at,
+      summary: r.summary,
+      tldr_bullets: r.tldr_bullets || [],
+      content: r.content,
       image_url,
       image_is_fallback: hasImage ? r.image_is_fallback : true,
+      categories: cats,
     };
   });
 
-  const ranked = rankArticles(articles, selected, likeCounts, totalLikes, likedIds);
+  const ranked = rankArticles(mapped as any, selected, likeCounts, totalLikes, likedIds);
   const page = ranked.slice(cursor, cursor + PAGE_SIZE);
   const nextCursor = cursor + page.length < ranked.length ? cursor + page.length : null;
 

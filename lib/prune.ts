@@ -1,12 +1,12 @@
-import { getDb } from "./db";
+import { initDb, getDb, articles, likes } from "./mongo";
 
 /**
  * Retention policy.
  *
- * `content` (the full article text) is ~79% of a row's size and is only used
- * by the reader's "Full Read" tab, so it is dropped first. Headline, summary,
- * TLDR, image and categories are kept so the card still renders and old links
- * keep working.
+ * `content` (the full article text) is ~79% of a document's size and is only
+ * used by the reader's "Full Read" tab, so it is dropped first. Headline,
+ * summary, TLDR, image and categories are kept so the card still renders and
+ * old links keep working.
  *
  * Articles a user liked are never deleted - likes drive the ranking model.
  */
@@ -23,37 +23,53 @@ export type PruneResult = {
   bytesAfter: number;
 };
 
+/** Mongo's equivalent of pg_database_size(). */
 async function dbBytes(): Promise<number> {
-  const res = await getDb().query("SELECT pg_database_size(current_database()) AS b");
-  return Number(res.rows[0].b);
+  const stats = (await (await getDb()).command({ dbStats: 1 })) as { dataSize?: number };
+  return Number(stats.dataSize || 0);
+}
+
+function daysAgo(days: number): Date {
+  return new Date(Date.now() - days * 24 * 60 * 60 * 1000);
 }
 
 export async function runPrune({ dryRun = false }: { dryRun?: boolean } = {}): Promise<PruneResult> {
-  const db = getDb();
+  await initDb();
+  const [articlesCol, likesCol] = await Promise.all([articles(), likes()]);
   const bytesBefore = await dbBytes();
 
-  const stripCutoff = `${STRIP_CONTENT_AFTER_DAYS} days`;
-  const deleteCutoff = `${DELETE_AFTER_DAYS} days`;
+  const stripCutoff = daysAgo(STRIP_CONTENT_AFTER_DAYS);
+  const deleteCutoff = daysAgo(DELETE_AFTER_DAYS);
+
+  // Postgres used COALESCE(published_at, created_at); $ifNull is the Mongo
+  // equivalent, expressed via $expr so it can be used inside a filter.
+  const olderThan = (cutoff: Date) => ({
+    $expr: { $lt: [{ $ifNull: ["$published_at", "$created_at"] }, cutoff] },
+  });
+
+  const strippableFilter = {
+    content: { $ne: null },
+    ...olderThan(stripCutoff),
+  };
+
+  // There are no joins here, so the "NOT EXISTS (SELECT 1 FROM likes ...)"
+  // clause becomes an explicit id exclusion. The liked set is tiny (one row per
+  // user per article) so pulling it into memory is cheap.
+  const likedIds = await likesCol.distinct("article_id");
+  const deletableFilter = {
+    ...olderThan(deleteCutoff),
+    id: { $nin: likedIds },
+  };
 
   if (dryRun) {
     const [strip, del] = await Promise.all([
-      db.query(
-        `SELECT count(*)::int AS n FROM articles
-         WHERE content IS NOT NULL
-           AND COALESCE(published_at, created_at) < NOW() - $1::interval`,
-        [stripCutoff]
-      ),
-      db.query(
-        `SELECT count(*)::int AS n FROM articles a
-         WHERE COALESCE(a.published_at, a.created_at) < NOW() - $1::interval
-           AND NOT EXISTS (SELECT 1 FROM likes l WHERE l.article_id = a.id)`,
-        [deleteCutoff]
-      ),
+      articlesCol.countDocuments(strippableFilter as any),
+      articlesCol.countDocuments(deletableFilter as any),
     ]);
     return {
       dryRun: true,
-      strippedContent: strip.rows[0].n,
-      deletedArticles: del.rows[0].n,
+      strippedContent: strip,
+      deletedArticles: del,
       stripAfterDays: STRIP_CONTENT_AFTER_DAYS,
       deleteAfterDays: DELETE_AFTER_DAYS,
       bytesBefore,
@@ -61,26 +77,16 @@ export async function runPrune({ dryRun = false }: { dryRun?: boolean } = {}): P
     };
   }
 
-  // Delete first so we don't waste work stripping rows that are about to go.
-  const deleted = await db.query(
-    `DELETE FROM articles a
-     WHERE COALESCE(a.published_at, a.created_at) < NOW() - $1::interval
-       AND NOT EXISTS (SELECT 1 FROM likes l WHERE l.article_id = a.id)`,
-    [deleteCutoff]
-  );
-
-  const stripped = await db.query(
-    `UPDATE articles
-     SET content = NULL
-     WHERE content IS NOT NULL
-       AND COALESCE(published_at, created_at) < NOW() - $1::interval`,
-    [stripCutoff]
-  );
+  // Delete first so we don't waste work stripping docs that are about to go.
+  const deleted = await articlesCol.deleteMany(deletableFilter as any);
+  const stripped = await articlesCol.updateMany(strippableFilter as any, {
+    $set: { content: null },
+  });
 
   return {
     dryRun: false,
-    strippedContent: stripped.rowCount || 0,
-    deletedArticles: deleted.rowCount || 0,
+    strippedContent: stripped.modifiedCount || 0,
+    deletedArticles: deleted.deletedCount || 0,
     stripAfterDays: STRIP_CONTENT_AFTER_DAYS,
     deleteAfterDays: DELETE_AFTER_DAYS,
     bytesBefore,
