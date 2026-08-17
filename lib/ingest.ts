@@ -92,9 +92,12 @@ export async function runIngestion(limit = 30) {
     }
 
     const topCategory = classified.categories[0].category;
-    const imageUrl = extracted.imageIsFallback
-      ? fallbackImageUrl(topCategory, item.title)
-      : extracted.imageUrl;
+    // Extraction can report a real image but still hand back no URL; treat that
+    // as a fallback rather than storing a null url flagged as non-fallback.
+    const hasRealImage = !extracted.imageIsFallback && !!extracted.imageUrl;
+    const imageUrl = hasRealImage
+      ? (extracted.imageUrl as string)
+      : fallbackImageUrl(topCategory, item.title);
 
     // Categories are embedded, so the article and its classifications land in a
     // single write instead of an insert plus one row per category.
@@ -110,7 +113,7 @@ export async function runIngestion(limit = 30) {
         tldr_bullets: classified.tldr || [],
         content: extracted.content,
         image_url: imageUrl,
-        image_is_fallback: extracted.imageIsFallback,
+        image_is_fallback: !hasRealImage,
         created_at: new Date(),
         categories: classified.categories.map((c) => ({
           category: c.category,

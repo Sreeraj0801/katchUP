@@ -49,7 +49,7 @@ export async function GET(request: Request) {
   const likeCounts: Record<string, number> = {};
   if (likedIds.size > 0) {
     const likedArticles = await articlesCol
-      .find({ id: { $in: [...likedIds] } }, { projection: { categories: 1 } })
+      .find({ id: { $in: Array.from(likedIds) } }, { projection: { categories: 1 } })
       .toArray();
     for (const a of likedArticles) {
       for (const c of a.categories || []) {

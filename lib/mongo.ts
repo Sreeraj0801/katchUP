@@ -113,9 +113,14 @@ export async function initDb(): Promise<void> {
   await Promise.all([
     a.createIndex({ id: 1 }, { unique: true }),
     a.createIndex({ link: 1 }, { unique: true }),
-    // Sparse: rows migrated from Postgres may have a null canonical_link, and a
-    // plain unique index would reject the second null.
-    a.createIndex({ canonical_link: 1 }, { unique: true, sparse: true }),
+    // Partial: only enforce uniqueness on real canonical links. A sparse index
+    // would still index explicit nulls and reject the second one, and partial
+    // filters don't accept `$ne`, so match on the type instead — that excludes
+    // both null and missing.
+    a.createIndex(
+      { canonical_link: 1 },
+      { unique: true, partialFilterExpression: { canonical_link: { $type: "string" } } }
+    ),
     a.createIndex({ published_at: -1 }),
     // Drives the feed query: match on embedded category + score, sort by date.
     a.createIndex({ "categories.category": 1, "categories.score": -1 }),

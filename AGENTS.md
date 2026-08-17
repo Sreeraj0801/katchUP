@@ -1,6 +1,6 @@
-# NewsReel — project notes
+# KatchUP — project notes
 
-Reels-style news feed. Next.js 14 (App Router) + PostgreSQL + Gemini.
+Reels-style news feed. Next.js 14 (App Router) + MongoDB Atlas + Gemini.
 
 ## Commands
 
@@ -10,7 +10,18 @@ npm run build        # production build (also runs lint + typecheck)
 npx tsc --noEmit     # typecheck only
 ```
 
-Requires `DATABASE_URL` and `GEMINI_API_KEY` (see `.env.example`).
+Requires `MONGODB_URI`, `MONGODB_DB`, and `GEMINI_API_KEY` (see `.env.example`).
+For local development, real secrets live in `.env.local` (gitignored).
+
+## Environment setup
+
+- **MongoDB Atlas**: create a cluster, add `MONGODB_URI` (with `?retryWrites=true&w=majority`)
+  and `MONGODB_DB` to `.env.local` and to Vercel's project environment variables.
+- **`.env.example`**: template only — never put real credentials there. It is
+  committed to git.
+- **Postgres migration** (one-time): `node scripts/migrate-to-mongo.mjs` reads the
+  source Postgres defined by `DATABASE_URL` and writes to the MongoDB cluster
+  in `.env.local`.
 
 ## Jobs
 
@@ -41,6 +52,15 @@ to the source when `content` is gone.
 Sizing: ~3.8 KB per article, of which `content` is ~79%. Stripped rows are
 ~800 bytes. At 100 articles/day that is ~139 MB/year unpruned, ~29 MB/year with
 the policy above.
+
+## Schema notes
+
+- `articles` keeps the integer `id` field to preserve public URLs and likes.
+  `categories` are embedded (`{ category, score }[]`) instead of a separate join
+  table.
+- `preferences` uses `_id` as `anon_id`.
+- `likes` is keyed by `(anon_id, article_id)` with a unique index.
+- `counters` holds `articleId` to replace Postgres `SERIAL`.
 
 ## Gemini quota
 
